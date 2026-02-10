@@ -3,7 +3,7 @@
 # ============================================================
 
 resource "aws_iam_role" "eks_node_role" {
-  name = "${var.cluster_name}-node-role"
+  name = "eks-sre-dev-nodes"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -88,7 +88,9 @@ module "eks" {
 
       disk_size = var.node_disk_size
 
-      iam_role_arn = aws_iam_role.eks_node_role.arn
+      iam_role_arn             = aws_iam_role.eks_node_role.arn
+      create_iam_role          = false
+      iam_role_use_name_prefix = false
 
       vpc_security_group_ids = [aws_security_group.node_sg.id]
 
@@ -124,7 +126,7 @@ module "eks" {
 # ============================================================
 
 resource "aws_iam_role" "ebs_csi_driver" {
-  name = "${var.cluster_name}-ebs-csi-driver"
+  name = "eks-sre-dev-ebs-csi"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
