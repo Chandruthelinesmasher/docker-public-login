@@ -1,4 +1,4 @@
-name: SRE AKS CI/CD Pipeline
+name: SRE EKS CI/CD Pipeline
 
 on:
   push:
@@ -7,22 +7,23 @@ on:
 
 permissions:
   contents: read
+  id-token: write  # Required for OIDC authentication
 
 env:
   TF_VERSION: "1.6.6"
+  AWS_REGION: us-east-2
 
   # App
   IMAGE_NAME: k8s-sre-monitoring-app
 
-  # Infra
-  LOCATION: eastus2
-  RESOURCE_GROUP: rg-sre-monitoring-dev
-
   # Terraform Backend
-  BACKEND_RESOURCE_GROUP: rg-terraform-state
-  BACKEND_STORAGE_ACCOUNT: tfstatesremonitoring
-  BACKEND_CONTAINER: tfstate
+  BACKEND_BUCKET: terraform-state-sre-monitoring
   BACKEND_KEY: sre-monitoring-dev.tfstate
+  BACKEND_REGION: us-east-2
+
+  # Infrastructure
+  ENVIRONMENT: dev
+  CLUSTER_NAME: eks-sre-monitoring-dev
 
 jobs:
 # ==========================================================
@@ -33,33 +34,32 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      acr_login_server: ${{ steps.tfout.outputs.acr_login_server }}
-      acr_name: ${{ steps.tfout.outputs.acr_name }}
-      aks_name: ${{ steps.tfout.outputs.aks_name }}
-      resource_group: ${{ steps.tfout.outputs.resource_group }}
+      ecr_repository_url: ${{ steps.tfout.outputs.ecr_repository_url }}
+      ecr_repository_name: ${{ steps.tfout.outputs.ecr_repository_name }}
+      eks_cluster_name: ${{ steps.tfout.outputs.eks_cluster_name }}
+      aws_region: ${{ steps.tfout.outputs.aws_region }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
       # -----------------------------
-      # Azure Login (Secret Method)
+      # AWS Authentication (OIDC)
       # -----------------------------
-      - name: Azure Login
-        uses: azure/login@v2
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Terraform
 
-      # -----------------------------
-      # Export ARM vars for Terraform
-      # -----------------------------
-      - name: Export ARM variables
-        run: |
-          CREDS='${{ secrets.AZURE_CREDENTIALS }}'
-          echo "ARM_CLIENT_ID=$(echo $CREDS | jq -r .clientId)" >> $GITHUB_ENV
-          echo "ARM_CLIENT_SECRET=$(echo $CREDS | jq -r .clientSecret)" >> $GITHUB_ENV
-          echo "ARM_TENANT_ID=$(echo $CREDS | jq -r .tenantId)" >> $GITHUB_ENV
-          echo "ARM_SUBSCRIPTION_ID=$(echo $CREDS | jq -r .subscriptionId)" >> $GITHUB_ENV
+      # Alternative: Using Access Keys (if not using OIDC)
+      # - name: Configure AWS Credentials
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: ${{ env.AWS_REGION }}
 
       # -----------------------------
       # Setup Terraform
@@ -71,35 +71,52 @@ jobs:
           terraform_wrapper: false
 
       # -----------------------------
-      # Backend Storage (Idempotent)
+      # Create S3 Backend (Idempotent)
       # -----------------------------
       - name: Setup Terraform Backend
         run: |
-          az group create \
-            --name $BACKEND_RESOURCE_GROUP \
-            --location $LOCATION \
-            --tags purpose=terraform-state || true
-
-          if ! az storage account show \
-            --name $BACKEND_STORAGE_ACCOUNT \
-            --resource-group $BACKEND_RESOURCE_GROUP &>/dev/null; then
-            az storage account create \
-              --name $BACKEND_STORAGE_ACCOUNT \
-              --resource-group $BACKEND_RESOURCE_GROUP \
-              --location $LOCATION \
-              --sku Standard_LRS \
-              --https-only true
+          # Create S3 bucket for state if it doesn't exist
+          if ! aws s3 ls s3://$BACKEND_BUCKET 2>/dev/null; then
+            echo "Creating S3 bucket: $BACKEND_BUCKET"
+            aws s3 mb s3://$BACKEND_BUCKET --region $BACKEND_REGION
+            
+            # Enable versioning
+            aws s3api put-bucket-versioning \
+              --bucket $BACKEND_BUCKET \
+              --versioning-configuration Status=Enabled
+            
+            # Enable encryption
+            aws s3api put-bucket-encryption \
+              --bucket $BACKEND_BUCKET \
+              --server-side-encryption-configuration '{
+                "Rules": [{
+                  "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "AES256"
+                  }
+                }]
+              }'
+            
+            # Block public access
+            aws s3api put-public-access-block \
+              --bucket $BACKEND_BUCKET \
+              --public-access-block-configuration \
+                "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+          else
+            echo "S3 bucket already exists: $BACKEND_BUCKET"
           fi
-
-          ACCOUNT_KEY=$(az storage account keys list \
-            --resource-group $BACKEND_RESOURCE_GROUP \
-            --account-name $BACKEND_STORAGE_ACCOUNT \
-            --query '[0].value' -o tsv)
-
-          az storage container create \
-            --name $BACKEND_CONTAINER \
-            --account-name $BACKEND_STORAGE_ACCOUNT \
-            --account-key $ACCOUNT_KEY || true
+          
+          # Create DynamoDB table for state locking if it doesn't exist
+          if ! aws dynamodb describe-table --table-name terraform-state-lock --region $BACKEND_REGION 2>/dev/null; then
+            echo "Creating DynamoDB table for state locking"
+            aws dynamodb create-table \
+              --table-name terraform-state-lock \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --billing-mode PAY_PER_REQUEST \
+              --region $BACKEND_REGION
+          else
+            echo "DynamoDB table already exists: terraform-state-lock"
+          fi
 
       # -----------------------------
       # Terraform Init
@@ -108,10 +125,11 @@ jobs:
         run: |
           cd terraform
           terraform init -upgrade \
-            -backend-config="resource_group_name=$BACKEND_RESOURCE_GROUP" \
-            -backend-config="storage_account_name=$BACKEND_STORAGE_ACCOUNT" \
-            -backend-config="container_name=$BACKEND_CONTAINER" \
-            -backend-config="key=$BACKEND_KEY"
+            -backend-config="bucket=$BACKEND_BUCKET" \
+            -backend-config="key=$BACKEND_KEY" \
+            -backend-config="region=$BACKEND_REGION" \
+            -backend-config="dynamodb_table=terraform-state-lock" \
+            -backend-config="encrypt=true"
 
       - name: Terraform Validate
         run: |
@@ -122,9 +140,9 @@ jobs:
         run: |
           cd terraform
           terraform plan \
-            -var="location=$LOCATION" \
-            -var="resource_group_name=$RESOURCE_GROUP" \
-            -var="environment=dev" \
+            -var="aws_region=$AWS_REGION" \
+            -var="environment=$ENVIRONMENT" \
+            -var="cluster_name=$CLUSTER_NAME" \
             -out=tfplan
 
       - name: Terraform Apply
@@ -133,35 +151,37 @@ jobs:
           terraform apply -auto-approve tfplan
 
       # -----------------------------
-      # Verify ACR Integration (Managed by Terraform)
+      # Verify ECR and EKS Integration
       # -----------------------------
-      - name: Verify ACR Integration
+      - name: Verify Infrastructure
         run: |
           echo "=========================================="
-          echo "Verifying ACR Integration..."
+          echo "Verifying AWS Infrastructure..."
           echo "=========================================="
           
           cd terraform
           
           # Get outputs from Terraform
-          ACR_ROLE_ASSIGNMENT=$(terraform output -raw acr_role_assignment_id)
+          ECR_REPO=$(terraform output -raw ecr_repository_url)
+          EKS_CLUSTER=$(terraform output -raw eks_cluster_name)
           
-          echo "✅ ACR Role Assignment ID: $ACR_ROLE_ASSIGNMENT"
+          echo "✅ ECR Repository: $ECR_REPO"
+          echo "✅ EKS Cluster: $EKS_CLUSTER"
           echo ""
-          echo "ACR integration is managed by Terraform and configured automatically!"
-          echo "AKS can now pull images from ACR without manual intervention."
+          echo "EKS nodes have IAM roles that allow pulling from ECR automatically!"
+          echo "No additional authentication needed for image pulls."
 
       - name: Export Terraform Outputs
         id: tfout
         run: |
           cd terraform
-          echo "acr_login_server=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
-          echo "acr_name=$(terraform output -raw acr_name)" >> $GITHUB_OUTPUT
-          echo "aks_name=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
-          echo "resource_group=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+          echo "ecr_repository_url=$(terraform output -raw ecr_repository_url)" >> $GITHUB_OUTPUT
+          echo "ecr_repository_name=$(terraform output -raw ecr_repository_name)" >> $GITHUB_OUTPUT
+          echo "eks_cluster_name=$(terraform output -raw eks_cluster_name)" >> $GITHUB_OUTPUT
+          echo "aws_region=$(terraform output -raw aws_region)" >> $GITHUB_OUTPUT
 
 # ==========================================================
-# BUILD & PUSH IMAGE
+# BUILD & PUSH IMAGE TO ECR
 # ==========================================================
   build-and-push:
     name: Build & Push Docker Image
@@ -171,13 +191,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Azure Login
-        uses: azure/login@v2
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ needs.terraform.outputs.aws_region }}
+          role-session-name: GitHubActions-ECR
 
-      - name: Login to ACR
-        run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Verify app directory exists
         run: |
@@ -190,21 +213,32 @@ jobs:
           echo "App directory contents:"
           ls -la app/
 
-      - name: Build Image
+      - name: Build Docker Image
         run: |
           cd app
           docker build \
-            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest \
-            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ needs.terraform.outputs.ecr_repository_url }}:latest \
+            -t ${{ needs.terraform.outputs.ecr_repository_url }}:${{ github.sha }} \
             .
 
-      - name: Push Images
+      - name: Push Images to ECR
         run: |
-          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
-          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ needs.terraform.outputs.ecr_repository_url }}:latest
+          docker push ${{ needs.terraform.outputs.ecr_repository_url }}:${{ github.sha }}
+
+      - name: Scan Image for Vulnerabilities
+        continue-on-error: true
+        run: |
+          echo "Waiting for ECR scan to complete..."
+          sleep 10
+          
+          aws ecr describe-image-scan-findings \
+            --repository-name ${{ needs.terraform.outputs.ecr_repository_name }} \
+            --image-id imageTag=latest \
+            --region ${{ needs.terraform.outputs.aws_region }} || echo "Scan not yet available"
 
 # ==========================================================
-# DEPLOY APP + MONITORING
+# DEPLOY APP + MONITORING TO EKS
 # ==========================================================
   deploy:
     name: Deploy App & Monitoring
@@ -214,24 +248,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Azure Login
-        uses: azure/login@v2
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ needs.terraform.outputs.aws_region }}
+          role-session-name: GitHubActions-EKS
 
-      - name: Get AKS Credentials
+      # -----------------------------
+      # Setup kubectl
+      # -----------------------------
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Update kubeconfig for EKS
         run: |
-          az aks get-credentials \
-            --resource-group ${{ needs.terraform.outputs.resource_group }} \
-            --name ${{ needs.terraform.outputs.aks_name }} \
-            --overwrite-existing
+          aws eks update-kubeconfig \
+            --region ${{ needs.terraform.outputs.aws_region }} \
+            --name ${{ needs.terraform.outputs.eks_cluster_name }}
 
+      - name: Verify EKS Connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      # -----------------------------
+      # Create Namespaces
+      # -----------------------------
       - name: Create Namespaces
         run: |
           kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
           kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Deploy Monitoring Stack (First)
+      # -----------------------------
+      # Deploy Monitoring Stack
+      # -----------------------------
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.0'
+
+      - name: Deploy Monitoring Stack (Prometheus & Grafana)
         run: |
           echo "Installing Prometheus Operator and monitoring stack..."
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
@@ -240,6 +299,8 @@ jobs:
           helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
             -n monitoring \
             --set grafana.adminPassword=admin123 \
+            --set prometheus.service.type=LoadBalancer \
+            --set grafana.service.type=LoadBalancer \
             --wait \
             --timeout 10m
           
@@ -247,14 +308,17 @@ jobs:
           kubectl wait --for condition=established --timeout=300s \
             crd/servicemonitors.monitoring.coreos.com || echo "ServiceMonitor CRD check timed out"
 
+      # -----------------------------
+      # Deploy Application
+      # -----------------------------
       - name: Deploy Application
         run: |
           echo "=========================================="
           echo "Deploying application resources..."
           echo "=========================================="
           
-          # Update image reference
-          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest|g" k8s/app/deployment.yaml
+          # Update image reference with ECR URL
+          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.ecr_repository_url }}:latest|g" k8s/app/deployment.yaml
           
           # Apply application manifests
           kubectl apply -f k8s/app -n app
@@ -280,9 +344,12 @@ jobs:
             echo "⚠️  WARNING: Detected image pull issues. Checking pod events..."
             kubectl describe pods -l app=sre-app -n app | grep -A 10 "Events:"
             echo ""
-            echo "Note: ACR integration is managed by Terraform and should be configured."
+            echo "Note: EKS nodes should have IAM roles to pull from ECR automatically."
           fi
 
+      # -----------------------------
+      # Deploy ServiceMonitor
+      # -----------------------------
       - name: Deploy ServiceMonitor
         run: |
           echo "Deploying ServiceMonitor for metrics scraping..."
@@ -296,6 +363,9 @@ jobs:
             echo "This usually means Prometheus Operator is not fully installed yet."
           fi
 
+      # -----------------------------
+      # Verify Deployment
+      # -----------------------------
       - name: Verify Deployment
         run: |
           echo "Waiting for pods to be ready..."
@@ -340,35 +410,43 @@ jobs:
           
           echo ""
           echo "=========================================="
-          echo "=== APPLICATION LOAD BALANCER IP ==="
+          echo "=== APPLICATION LOAD BALANCER DNS ==="
           echo "=========================================="
-          APP_IP=$(kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
-          if [ "$APP_IP" != "pending" ]; then
-            echo "Application URL: http://$APP_IP"
+          APP_LB=$(kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+          if [ "$APP_LB" != "pending" ]; then
+            echo "Application URL: http://$APP_LB"
           else
-            echo "LoadBalancer IP not yet assigned (this may take a few minutes)"
+            echo "LoadBalancer DNS not yet assigned (this may take a few minutes)"
+            echo "Run: kubectl get svc sre-app-service -n app"
           fi
           
           echo ""
           echo "=========================================="
           echo "=== GRAFANA ACCESS ==="
           echo "=========================================="
-          GRAFANA_IP=$(kubectl get svc monitoring-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
-          if [ "$GRAFANA_IP" != "pending" ]; then
-            echo "Grafana URL: http://$GRAFANA_IP"
+          GRAFANA_LB=$(kubectl get svc monitoring-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+          if [ "$GRAFANA_LB" != "pending" ]; then
+            echo "Grafana URL: http://$GRAFANA_LB"
             echo "Username: admin"
             echo "Password: admin123"
           else
-            echo "Grafana LoadBalancer IP pending..."
+            echo "Grafana LoadBalancer DNS pending..."
+            echo "Run: kubectl get svc monitoring-grafana -n monitoring"
           fi
           
           echo ""
           echo "=========================================="
           echo "=== PROMETHEUS ACCESS ==="
           echo "=========================================="
-          PROM_IP=$(kubectl get svc monitoring-kube-prometheus-prometheus -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
-          if [ "$PROM_IP" != "pending" ]; then
-            echo "Prometheus URL: http://$PROM_IP:9090"
+          PROM_LB=$(kubectl get svc monitoring-kube-prometheus-prometheus -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+          if [ "$PROM_LB" != "pending" ]; then
+            echo "Prometheus URL: http://$PROM_LB:9090"
           else
-            echo "Prometheus LoadBalancer IP pending..."
+            echo "Prometheus LoadBalancer DNS pending..."
+            echo "Run: kubectl get svc monitoring-kube-prometheus-prometheus -n monitoring"
           fi
+          
+          echo ""
+          echo "=========================================="
+          echo "🎉 Deployment Complete!"
+          echo "=========================================="
