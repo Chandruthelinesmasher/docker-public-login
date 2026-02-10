@@ -1,3 +1,49 @@
+# ============================================================
+# IAM ROLE FOR EKS NODES
+# ============================================================
+
+resource "aws_iam_role" "eks_node_role" {
+  name = "${var.cluster_name}-node-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = var.tags
+}
+
+# Attach required policies
+resource "aws_iam_role_policy_attachment" "eks_node_AmazonEKSWorkerNodePolicy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+  role       = aws_iam_role.eks_node_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_node_AmazonEKS_CNI_Policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.eks_node_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_node_AmazonEC2ContainerRegistryReadOnly" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.eks_node_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "eks_node_AmazonSSMManagedInstanceCore" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  role       = aws_iam_role.eks_node_role.name
+}
+
+# ============================================================
+# EKS CLUSTER
+# ============================================================
+
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 19.0"
@@ -9,13 +55,10 @@ module "eks" {
   subnet_ids                     = module.vpc.private_subnets
   cluster_endpoint_public_access = true
 
-  # Cluster security group
   cluster_additional_security_group_ids = [aws_security_group.cluster_sg.id]
 
-  # OIDC Provider for IRSA (IAM Roles for Service Accounts)
   enable_irsa = true
 
-  # Cluster Addons
   cluster_addons = {
     coredns = {
       most_recent = true
@@ -32,7 +75,6 @@ module "eks" {
     }
   }
 
-  # EKS Managed Node Group
   eks_managed_node_groups = {
     main = {
       name = "${var.cluster_name}-node-group"
@@ -46,10 +88,8 @@ module "eks" {
 
       disk_size = var.node_disk_size
 
-      # Node group IAM role
       iam_role_arn = aws_iam_role.eks_node_role.arn
 
-      # Additional security groups
       vpc_security_group_ids = [aws_security_group.node_sg.id]
 
       labels = {
@@ -61,42 +101,11 @@ module "eks" {
         var.tags,
         {
           Name = "${var.cluster_name}-node-group"
-          "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
-          "k8s.io/cluster-autoscaler/enabled"             = var.enable_cluster_autoscaler ? "true" : "false"
         }
       )
-
-      # Launch template configuration
-      create_launch_template = true
-      launch_template_name   = "${var.cluster_name}-node-template"
-
-      block_device_mappings = {
-        xvda = {
-          device_name = "/dev/xvda"
-          ebs = {
-            volume_size           = var.node_disk_size
-            volume_type           = "gp3"
-            iops                  = 3000
-            throughput            = 150
-            encrypted             = true
-            delete_on_termination = true
-          }
-        }
-      }
-
-      metadata_options = {
-        http_endpoint               = "enabled"
-        http_tokens                 = "required"
-        http_put_response_hop_limit = 2
-        instance_metadata_tags      = "enabled"
-      }
-
-      # User data for node configuration
-      user_data_template_path = "${path.module}/templates/user-data.sh.tpl"
     }
   }
 
-  # Cluster access management
   manage_aws_auth_configmap = true
 
   aws_auth_roles = [
@@ -107,15 +116,13 @@ module "eks" {
     }
   ]
 
-  tags = merge(
-    var.tags,
-    {
-      Name = var.cluster_name
-    }
-  )
+  tags = var.tags
 }
 
-# IAM Role for EBS CSI Driver
+# ============================================================
+# IAM ROLE FOR EBS CSI DRIVER
+# ============================================================
+
 resource "aws_iam_role" "ebs_csi_driver" {
   name = "${var.cluster_name}-ebs-csi-driver"
 
@@ -136,12 +143,7 @@ resource "aws_iam_role" "ebs_csi_driver" {
     }]
   })
 
-  tags = merge(
-    var.tags,
-    {
-      Name = "${var.cluster_name}-ebs-csi-driver"
-    }
-  )
+  tags = var.tags
 }
 
 resource "aws_iam_role_policy_attachment" "ebs_csi_driver" {
@@ -149,15 +151,13 @@ resource "aws_iam_role_policy_attachment" "ebs_csi_driver" {
   role       = aws_iam_role.ebs_csi_driver.name
 }
 
-# CloudWatch Log Group for EKS Cluster
+# ============================================================
+# CLOUDWATCH LOG GROUP
+# ============================================================
+
 resource "aws_cloudwatch_log_group" "eks_cluster" {
   name              = "/aws/eks/${var.cluster_name}/cluster"
   retention_in_days = 7
 
-  tags = merge(
-    var.tags,
-    {
-      Name = "${var.cluster_name}-logs"
-    }
-  )
+  tags = var.tags
 }

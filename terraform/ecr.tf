@@ -1,10 +1,13 @@
-# ECR Repository for Docker Images
+# ============================================================
+# ECR REPOSITORY
+# ============================================================
+
 resource "aws_ecr_repository" "app" {
-  name                 = var.ecr_repository_name
-  image_tag_mutability = var.ecr_image_tag_mutability
+  name                 = "k8s-sre-monitoring-app"
+  image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
-    scan_on_push = var.ecr_scan_on_push
+    scan_on_push = true
   }
 
   encryption_configuration {
@@ -14,12 +17,15 @@ resource "aws_ecr_repository" "app" {
   tags = merge(
     var.tags,
     {
-      Name = var.ecr_repository_name
+      Name = "k8s-sre-monitoring-app"
     }
   )
 }
 
-# ECR Lifecycle Policy to manage image retention
+# ============================================================
+# ECR LIFECYCLE POLICY
+# ============================================================
+
 resource "aws_ecr_lifecycle_policy" "app" {
   repository = aws_ecr_repository.app.name
 
@@ -27,61 +33,15 @@ resource "aws_ecr_lifecycle_policy" "app" {
     rules = [
       {
         rulePriority = 1
-        description  = "Keep last ${var.ecr_image_retention_count} images"
+        description  = "Keep last 10 images"
         selection = {
-          tagStatus     = "tagged"
-          tagPrefixList = ["v", "latest"]
-          countType     = "imageCountMoreThan"
-          countNumber   = var.ecr_image_retention_count
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 10
         }
         action = {
           type = "expire"
         }
-      },
-      {
-        rulePriority = 2
-        description  = "Delete untagged images older than 7 days"
-        selection = {
-          tagStatus   = "untagged"
-          countType   = "sinceImagePushed"
-          countUnit   = "days"
-          countNumber = 7
-        }
-        action = {
-          type = "expire"
-        }
-      }
-    ]
-  })
-}
-
-# ECR Repository Policy for cross-account access (optional)
-resource "aws_ecr_repository_policy" "app" {
-  repository = aws_ecr_repository.app.name
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowPushPull"
-        Effect = "Allow"
-        Principal = {
-          AWS = [
-            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-          ]
-        }
-        Action = [
-          "ecr:GetDownloadUrlForLayer",
-          "ecr:BatchGetImage",
-          "ecr:BatchCheckLayerAvailability",
-          "ecr:PutImage",
-          "ecr:InitiateLayerUpload",
-          "ecr:UploadLayerPart",
-          "ecr:CompleteLayerUpload",
-          "ecr:DescribeRepositories",
-          "ecr:GetRepositoryPolicy",
-          "ecr:ListImages"
-        ]
       }
     ]
   })
