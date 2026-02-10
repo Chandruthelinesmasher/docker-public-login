@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # Required for OIDC authentication
 
 env:
   TF_VERSION: "1.6.6"
@@ -34,7 +33,6 @@ jobs:
   terraform:
     name: Terraform Infra
     runs-on: ubuntu-latest
-    environment: production
 
     outputs:
       ecr_repository_url: ${{ steps.tfout.outputs.ecr_repository_url }}
@@ -47,23 +45,14 @@ jobs:
         uses: actions/checkout@v4
 
       # -----------------------------
-      # AWS Authentication (OIDC)
+      # AWS Authentication (Access Keys)
       # -----------------------------
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GitHubActions-Terraform
-
-      # Alternative: Using Access Keys (if not using OIDC)
-      # Uncomment the lines below and comment out the OIDC section above
-      # - name: Configure AWS Credentials
-      #   uses: aws-actions/configure-aws-credentials@v4
-      #   with:
-      #     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #     aws-region: ${{ env.AWS_REGION }}
 
       # -----------------------------
       # Setup Terraform
@@ -218,18 +207,20 @@ jobs:
     needs: terraform
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # -----------------------------
+      # AWS Authentication (Access Keys)
+      # -----------------------------
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ needs.terraform.outputs.aws_region }}
-          role-session-name: GitHubActions-ECR
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -304,18 +295,20 @@ jobs:
     needs: [terraform, build-and-push]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # -----------------------------
+      # AWS Authentication (Access Keys)
+      # -----------------------------
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ needs.terraform.outputs.aws_region }}
-          role-session-name: GitHubActions-EKS
 
       # -----------------------------
       # Setup kubectl
