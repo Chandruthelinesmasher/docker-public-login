@@ -20,9 +20,9 @@ jobs:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    # Step 2: Pull Image (optional validation step)
+    # Step 2: Pull Image (Validation Step)
     - name: Pull Docker Image
-      run: docker pull your-dockerhub-username/your-image:latest
+      run: docker pull chandrulinesmasher/mysampleappv1:latest
 
     # Step 3: Deploy to EC2
     - name: SSH and Deploy
@@ -34,5 +34,5 @@ jobs:
         script: |
           docker stop myapp || true
           docker rm myapp || true
-          docker pull your-dockerhub-username/your-image:latest
-          docker run -d -p 80:3000 --name myapp your-dockerhub-username/your-image:latest
+          docker pull chandrulinesmasher/mysampleappv1:latest
+          docker run -d -p 80:3000 --name myapp chandrulinesmasher/mysampleappv1:latest
