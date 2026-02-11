@@ -10,29 +10,44 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    # Step 1: Checkout Repository
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # Step 1: Login to DockerHub
+    # Step 2: Login to DockerHub
     - name: Login to DockerHub
       uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    # Step 2: Pull Image (Validation Step)
+    # Step 3: Validate Image Pull (Optional Safety Check)
     - name: Pull Docker Image
       run: docker pull chandrulinesmasher/mysampleappv1:latest
 
-    # Step 3: Deploy to EC2
+    # Step 4: SSH into EC2 and Deploy
     - name: SSH and Deploy
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.EC2_HOST }}
         username: ${{ secrets.EC2_USER }}
         key: ${{ secrets.EC2_SSH_KEY }}
+        port: 22
         script: |
-          docker stop myapp || true
-          docker rm myapp || true
-          docker pull chandrulinesmasher/mysampleappv1:latest
-          docker run -d -p 80:3000 --name myapp chandrulinesmasher/mysampleappv1:latest
+          echo "Stopping existing container..."
+          sudo docker stop myapp || true
+          
+          echo "Removing old container..."
+          sudo docker rm myapp || true
+          
+          echo "Pulling latest image..."
+          sudo docker pull chandrulinesmasher/mysampleappv1:latest
+          
+          echo "Starting new container..."
+          sudo docker run -d \
+            -p 80:3000 \
+            --restart always \
+            --name myapp \
+            chandrulinesmasher/mysampleappv1:latest
+          
+          echo "Deployment completed successfully!"
