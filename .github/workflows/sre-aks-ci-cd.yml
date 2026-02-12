@@ -1,4 +1,4 @@
-name: Deploy to EC2
+name: CI-CD Pipeline
 
 on:
   push:
@@ -6,48 +6,93 @@ on:
       - main
 
 jobs:
-  deploy:
+
+  # ===============================
+  # STAGE 1 - TEST STAGE
+  # ===============================
+  test:
+    name: Run Tests
     runs-on: ubuntu-latest
 
     steps:
-    # Step 1: Checkout Repository
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    # Step 2: Login to DockerHub
-    - name: Login to DockerHub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
 
-    # Step 3: Validate Image Pull (Optional Safety Check)
-    - name: Pull Docker Image
-      run: docker pull chandrulinesmasher/mysampleappv1:latest
+      - name: Install Dependencies
+        run: |
+          cd app
+          npm install
 
-    # Step 4: SSH into EC2 and Deploy
-    - name: SSH and Deploy
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ${{ secrets.EC2_USER }}
-        key: ${{ secrets.EC2_SSH_KEY }}
-        port: 22
-        script: |
-          echo "Stopping existing container..."
-          sudo docker stop myapp || true
-          
-          echo "Removing old container..."
-          sudo docker rm myapp || true
-          
-          echo "Pulling latest image..."
-          sudo docker pull chandrulinesmasher/mysampleappv1:latest
-          
-          echo "Starting new container..."
-          sudo docker run -d \
-            -p 80:3000 \
-            --restart always \
-            --name myapp \
-            chandrulinesmasher/mysampleappv1:latest
-          
-          echo "Deployment completed successfully!"
+      - name: Skip Tests (No test script configured)
+        run: |
+          cd app
+          echo "No automated tests configured yet. Skipping test stage."
+
+
+  # ===============================
+  # STAGE 2 - BUILD & PUSH DOCKER
+  # ===============================
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Docker Image
+        run: |
+          cd app
+          docker build -t chandrulinesmasher/mysampleappv1:latest .
+
+      - name: Push Docker Image
+        run: |
+          docker push chandrulinesmasher/mysampleappv1:latest
+
+
+  # ===============================
+  # STAGE 3 - DEPLOY TO EC2
+  # ===============================
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script: |
+            echo "Stopping old container..."
+            sudo docker stop myapp || true
+
+            echo "Removing old container..."
+            sudo docker rm myapp || true
+
+            echo "Pulling latest image..."
+            sudo docker pull chandrulinesmasher/mysampleappv1:latest
+
+            echo "Starting new container..."
+            sudo docker run -d \
+              -p 80:3000 \
+              --restart always \
+              --name myapp \
+              chandrulinesmasher/mysampleappv1:latest
+
+            echo "Deployment Successful!"
